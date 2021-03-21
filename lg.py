@@ -247,35 +247,49 @@ def summary(hosts, proto="ipv4"):
     summary = {}
     errors = []
     for host in hosts.split("+"):
-        ret, res = bird_command(host, proto, command)
-        res = res.split("\n")
-
-        if ret is False:
-            errors.append("%s" % res)
-            continue
-
-        if len(res) <= 1:
-            errors.append("%s: bird command failed with error, %s" % (host, "\n".join(res)))
-            continue
-
         data = []
-        for line in res[1:]:
-            line = line.strip()
-            if line and (line.split() + [""])[1] not in SUMMARY_UNWANTED_PROTOS:
-                split = line.split()
-                if len(split) >= 5:
-                    props = dict()
-                    props["name"] = split[0]
-                    props["proto"] = split[1]
-                    props["table"] = split[2]
-                    props["state"] = split[3]
-                    props["since"] = split[4]
-                    props["info"] = ' '.join(split[5:]) if len(split) > 5 else ""
-                    data.append(props)
-                else:
-                    app.logger.warning("couldn't parse: %s", line)
+        for proto in ['ipv4','ipv6']:    
+            ret, res = bird_command(host, proto, command)
+            res = res.split("\n")
 
-        summary[host] = data
+            if ret is False:
+                errors.append("%s" % res)
+                continue
+
+            if len(res) <= 1:
+                errors.append("%s: bird command failed with error, %s" % (host, "\n".join(res)))
+                continue
+
+            for line in res[1:]:
+                line = line.strip()
+                if line and (line.split() + [""])[1] not in SUMMARY_UNWANTED_PROTOS:
+                    split = line.split()
+                    if len(split) >= 5:
+                        props = dict()
+                        appendprops = 1
+                        for props1 in data:
+                            if (props1['name'] == split[0]):
+                                props = props1
+                                appendprops = 0
+                                break
+                        props["name"] = split[0]
+                        props["proto"] = split[1]
+                        if proto == "ipv6":
+                            props["table6"] = split[2]
+                            props["state6"] = split[3]
+                            props["since6"] = split[4]
+                            props["info6"] = ' '.join(split[5:]) if len(split) > 5 else ""
+                        else:
+                            props["table"] = split[2]
+                            props["state"] = split[3]
+                            props["since"] = split[4]
+                            props["info"] = ' '.join(split[5:]) if len(split) > 5 else ""
+                        if (appendprops):
+                            data.append(props)
+                    else:
+                        app.logger.warning("couldn't parse: %s", line)
+
+            summary[host] = data
 
     return render_template('summary.html', summary=summary, command=command, errors=errors)
 

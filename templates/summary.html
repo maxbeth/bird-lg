@@ -4,7 +4,9 @@
 <h3 style="float:left">{{host}}: {{command}}</h3>
 <table class="table table-striped table-bordered table-condensed table-summary">
 <thead>
-	<tr><th>Name</th><th>protocol</th><th>table</th><th>state</th><th>since</th><th>info</th></tr>
+	<tr><th>Name</th><th>protocol</th>
+		<th>IPv4-table</th><th>state</th><th>since</th><th>info</th>
+		<th>IPv6-table</th><th>state</th><th>since</th><th>info</th></tr>
 </thead>
 <tbody>
 	{% for row in summary[host] %}
@@ -15,6 +17,10 @@
         <td><span class="label label-{% if row.state == "up" %}success{% elif row.state == "down" %}default{% else %}important{% endif %}">{{row.state}}</span></td>
         <td>{{row.since}}</td>
         <td>{{row.info}}</td>
+        <td>{{row.table6}}</td>
+        <td><span class="label label-{% if row.state6 == "up" %}success{% elif row.state6 == "down" %}default{% else %}important{% endif %}">{{row.state6}}</span></td>
+        <td>{{row.since6}}</td>
+        <td>{{row.info6}}</td>
     </tr>
 	{% else %}
 	<tr><td>{{summary[host].error}}</td><td></td><td></td><td></td><td></td><td></td></tr>
