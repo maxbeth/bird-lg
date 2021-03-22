@@ -29,16 +29,27 @@ resolv.timeout = 0.5
 resolv.lifetime = 1
 
 def resolve(n, q):
-    return str(resolv.query(n,q)[0])
+	return str(resolv.query(n,q)[0])
+
+def resolve_any(h):
+    try:
+        return resolve(h, "AAAA")
+    except:
+        pass
+    return resolve(h, "A")
+
 
 def mask_is_valid(n):
-    if not n:
-        return True
-    try:
-        mask = int(n)
-        return ( mask >= 1 and mask <= 128)
-    except:
-        return False
+	if not n: 
+		return True
+	try:
+		mask = int(n)
+		return ( mask >= 1 and mask <= 128)
+	except:
+		return False
+
+def ip_is_valid(n):
+    return ipv4_is_valid(n) or ipv6_is_valid(n)
 
 def ipv4_is_valid(n):
     try:
@@ -55,25 +66,25 @@ def ipv6_is_valid(n):
         return False
 
 def save_cache_pickle(filename, data):
-    output = open(filename, 'wb')
-    pickle.dump(data, output)
-    output.close()
+	output = open(filename, 'wb')
+	pickle.dump(data, output)
+	output.close()
 
 def load_cache_pickle(filename, default = None):
-    try:
-        pkl_file = open(filename, 'rb')
-    except IOError:
-        return default
-    try:
-        data = pickle.load(pkl_file)
-    except:
-        data = default
-    pkl_file.close()
-    return data
+	try:
+		pkl_file = open(filename, 'rb')
+	except IOError:
+		return default
+	try:
+		data = pickle.load(pkl_file)
+	except:
+		data = default
+	pkl_file.close()
+	return data
 
 def unescape(s):
     want_unicode = False
-    if isinstance(s, unicode):
+    if isinstance(s, str):
         s = s.encode("utf-8")
         want_unicode = True
 
@@ -95,5 +106,5 @@ def unescape(s):
     # join the extracted strings and return
     es = ""
     if want_unicode:
-        es = u""
+        es = ""
     return es.join(list)

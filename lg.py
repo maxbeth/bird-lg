@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 # vim: ts=4
 ###
@@ -27,24 +27,20 @@ import subprocess
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import re
-from urllib2 import urlopen
-from urllib import quote, unquote
+from urllib.request import urlopen
+from urllib.parse import quote, unquote
 import json
 import random
-import argparse
 
-from toolbox import mask_is_valid, ipv6_is_valid, ipv4_is_valid, resolve, save_cache_pickle, load_cache_pickle, unescape
+from toolbox import mask_is_valid, ip_is_valid, ipv6_is_valid, ipv4_is_valid, resolve, resolve_any, save_cache_pickle, load_cache_pickle, unescape
 #from xml.sax.saxutils import escape
 
 
 import pydot
 from flask import Flask, render_template, jsonify, redirect, session, request, abort, Response, Markup
-parser = argparse.ArgumentParser()
-parser.add_argument('-c', dest='config_file', help='path to config file', default='lg.cfg')
-args = parser.parse_args()
 
 app = Flask(__name__)
-app.config.from_pyfile(args.config_file)
+app.config.from_pyfile('lg.cfg')
 app.secret_key = app.config["SESSION_KEY"]
 app.debug = app.config["DEBUG"]
 
@@ -57,19 +53,22 @@ memcache_expiration = int(app.config.get("MEMCACHE_EXPIRATION", "1296000")) # 1
 mc = memcache.Client([memcache_server])
 
 def get_asn_from_as(n):
-    asn_zone = app.config.get("ASN_ZONE", "asn.cymru.com")
-    try:
-        data = resolve("AS%s.%s" % (n, asn_zone) ,"TXT").replace("'","").replace('"','')
-    except:
-        return " "*5
-    return [ field.strip() for field in data.split("|") ]
-
+    asn_zone = app.config.get("ASN_ZONE", False)
+    # don't generate spurious (and potentially slow) lookups if ASN_ZONE not defined in config
+    if asn_zone:
+        try:
+            data = resolve("AS%s.%s" % (n, asn_zone) ,"TXT").replace("'","").replace('"','')
+        except:
+            return False
+        return [ field.strip() for field in data.split("|") ]
+    else:
+        return False
 
 def add_links(text):
     """Browser a string and replace ipv4, ipv6, as number, with a
     whois link """
 
-    if type(text) in [str, unicode]:
+    if type(text) in [str, str]:
         text = text.split("\n")
 
     ret_text = []
@@ -123,7 +122,10 @@ def whois_command(query):
 
 def bird_command(host, proto, query):
     """Alias to bird_proxy for bird service"""
-    return bird_proxy(host, proto, "bird", query)
+    if app.config.get("UNIFIED_DAEMON", False):
+        return bird_proxy(host, app.config.get("PROTO_DEFAULT", "ipv4"), "bird", query)
+    else:
+        return bird_proxy(host, proto, "bird", query)
 
 
 def bird_proxy(host, proto, service, query):
@@ -142,31 +144,26 @@ def bird_proxy(host, proto, service, query):
     elif proto == "ipv4":
         path = service
 
-    port = app.config["PROXY"].get(host, "")
+    proxyHost = app.config["PROXY"].get(host, "")
+    if isinstance(proxyHost, int):
+        proxyHost = "%s:%s" % (host, proxyHost)
 
-    if not port:
+    if not proxyHost:
         return False, 'Host "%s" invalid' % host
     elif not path:
         return False, 'Proto "%s" invalid' % proto
+    else:
+        url = "http://%s/%s?q=%s" % (proxyHost, path, quote(query))
+        proxy_timeout = app.config["PROXY_TIMEOUT"].get(service, 60)
 
-    url = "http://%s" % (host)
-    if "DOMAIN" in app.config:
-        url = "%s.%s" % (url, app.config["DOMAIN"])
-    url = "%s:%d/%s?" % (url, port, path)
-    if "SHARED_SECRET" in app.config:
-        url = "%ssecret=%s&" % (url, app.config["SHARED_SECRET"])
-    url = "%sq=%s" % (url, quote(query))
-
-    try:
-        f = urlopen(url)
-        resultat = f.read()
-        status = True                # retreive remote status
-    except IOError:
-        resultat = "Failed to retrieve URL for host %s" % host
-        app.logger.warning("Failed to retrieve URL for host %s: %s", host, url)
-        status = False
-
-    return status, resultat
+        try:
+            f = urlopen(url, None, proxy_timeout)
+            resultat = f.read().decode('utf-8')
+            status = True                # retreive remote status
+        except IOError:
+            resultat = "Failed retreive url: %s" % url
+            status = False
+        return status, resultat
 
 
 @app.context_processor
@@ -189,16 +186,16 @@ def inject_commands():
         commands_dict[id] = text
     return dict(commands=commands, commands_dict=commands_dict)
 
-
 @app.context_processor
 def inject_all_host():
-    return dict(all_hosts="+".join(app.config["PROXY"].keys()))
-
+    return dict(all_hosts="+".join(list(app.config["PROXY"].keys())))
 
 @app.route("/")
 def hello():
-    return redirect("/summary/%s/ipv4" % "+".join(app.config["PROXY"].keys()))
-
+    if app.config.get("UNIFIED_DAEMON", False):
+        return redirect("/summary/all")
+    else:
+        return redirect("/summary/all/%s" % app.config.get("PROTO_DEFAULT", "ipv4"))
 
 def error_page(text):
     return render_template('error.html', errors=[text]), 500
@@ -231,25 +228,39 @@ def whois():
         if m:
             query = query.groupdict()["domain"]
 
-    output = whois_command(query)
+    output = whois_command(query).replace("\n", "<br>")
     return jsonify(output=output, title=query)
 
+# Array of protocols that will be filtered from the summary listing
+SUMMARY_UNWANTED_PROTOS = ["Kernel", "Static", "Device", "BFD", "Direct", "RPKI"]
+# Array of regular expressions to match against protocol names,
+# and filter them from the summary view
+SUMMARY_UNWANTED_NAMES = []
 
-SUMMARY_UNWANTED_PROTOS = ["Kernel", "Static", "Device", "Direct"]
+COMBINED_UNWANTED_NAMES = None
+if len(SUMMARY_UNWANTED_NAMES) > 0 :  # If regex list is not empty
+    # combine the unwanted names to a single regex
+    COMBINED_UNWANTED_NAMES = '(?:%s)' % '|'.join(SUMMARY_UNWANTED_NAMES)
 
 @app.route("/summary/<hosts>")
 @app.route("/summary/<hosts>/<proto>")
 def summary(hosts, proto="ipv4"):
-
     set_session("summary", hosts, proto, "")
     command = "show protocols"
 
+    if (proto == "ipflat" or proto == "ip46"):
+        prots = ["ipv4", "ipv6"]
+    else:
+        prots = [proto]
     summary = {}
     errors = []
-    for host in hosts.split("+"):
+    hosts = hosts.split("+")
+    if hosts == ["all"]:
+        hosts = app.config["PROXY"].keys()
+    for host in hosts:
         data = []
-        for proto in ['ipv4','ipv6']:    
-            ret, res = bird_command(host, proto, command)
+        for protx in prots:
+            ret, res = bird_command(host, protx, command)
             res = res.split("\n")
 
             if ret is False:
@@ -262,40 +273,58 @@ def summary(hosts, proto="ipv4"):
 
             for line in res[1:]:
                 line = line.strip()
-                if line and (line.split() + [""])[1] not in SUMMARY_UNWANTED_PROTOS:
+                if line:
                     split = line.split()
-                    if len(split) >= 5:
-                        props = dict()
-                        appendprops = 1
-                        for props1 in data:
-                            if (props1['name'] == split[0]):
-                                props = props1
-                                appendprops = 0
-                                break
+                    if (
+                            len(split) >= 5 and
+                            split[1] not in SUMMARY_UNWANTED_PROTOS and
+                            (COMBINED_UNWANTED_NAMES is None or not re.match(COMBINED_UNWANTED_NAMES, split[0])) # If the list is empty or doesn't match the protocol name
+                       ):
+                        if ( proto == "ipflat"):
+                            props = dict()
+                            data.append(props)
+                        else:
+                            for searchprop in data:
+                                if (searchprop["name"] == split[0]):
+                                    props = searchprop
+                                    break
+                            else:
+                                props = dict()
+                                data.append(props)
                         props["name"] = split[0]
                         props["proto"] = split[1]
-                        if proto == "ipv6":
+                        props["ippro"] = protx
+                        if (proto == "ip46" and protx == "ipv6"):
                             props["table6"] = split[2]
                             props["state6"] = split[3]
                             props["since6"] = split[4]
-                            props["info6"] = ' '.join(split[5:]) if len(split) > 5 else ""
+                            infofield = "info6"
                         else:
                             props["table"] = split[2]
                             props["state"] = split[3]
                             props["since"] = split[4]
-                            props["info"] = ' '.join(split[5:]) if len(split) > 5 else ""
-                        if (appendprops):
-                            data.append(props)
-                    else:
-                        app.logger.warning("couldn't parse: %s", line)
+                            infofield = "info"
 
-            summary[host] = data
+                        if len(split) > 5:
+                            # if bird is configured for 'timeformat protocol iso long'
+                            # then the 5th column contains the time, rather than info
+                            match = re.match(r'\d\d:\d\d:\d\d', split[5])
+                            if match:
+                                props[infofield] = ' '.join(split[6:]) if len(split) > 6 else ""
+                            else:
+                                props[infofield] = ' '.join(split[5:])
+                        else:
+                            props[infofield] = ""
+                            
 
-    return render_template('summary.html', summary=summary, command=command, errors=errors)
+        summary[host] = data
+
+    return render_template('summary.html', summary=summary, command=command, errors=errors, proto=proto)
 
 
+@app.route("/detail/<hosts>")
 @app.route("/detail/<hosts>/<proto>")
-def detail(hosts, proto):
+def detail(hosts, proto="ipv4"):
     name = get_query()
 
     if not name:
@@ -306,25 +335,35 @@ def detail(hosts, proto):
 
     detail = {}
     errors = []
-    for host in hosts.split("+"):
-        ret, res = bird_command(host, proto, command)
-        res = res.split("\n")
+    if (proto == "ipflat" or proto == "ip46"):
+        prots = ["ipv4", "ipv6"]
+    else:
+        prots = [proto]
 
-        if ret is False:
-            errors.append("%s" % res)
-            continue
+    hosts = hosts.split("+")
+    if hosts == ["all"]:
+        hosts = app.config["PROXY"].keys()
+    for host in hosts:
+        for protx in prots:
+            ret, res = bird_command(host, protx, command)
+            res = res.split("\n")
 
-        if len(res) <= 1:
-            errors.append("%s: bird command failed with error, %s" % (host, "\n".join(res)))
-            continue
+            if ret is False:
+                errors.append("%s" % res)
+                continue
 
-        detail[host] = {"status": res[1], "description": add_links(res[2:])}
+            if len(res) <= 1:
+                errors.append("%s: bird command failed with error, %s" % (host, "\n".join(res)))
+                continue
+
+            detail[host+protx] = {"status": res[1], "description": add_links(res[2:])}
 
     return render_template('detail.html', detail=detail, command=command, errors=errors)
 
 
+@app.route("/traceroute/<hosts>")
 @app.route("/traceroute/<hosts>/<proto>")
-def traceroute(hosts, proto):
+def traceroute(hosts, proto="ipv4"):
     q = get_query()
 
     if not q:
@@ -332,20 +371,37 @@ def traceroute(hosts, proto):
 
     set_session("traceroute", hosts, proto, q)
 
-    if proto == "ipv6" and not ipv6_is_valid(q):
-        try:
-            q = resolve(q, "AAAA")
-        except:
-            return error_page("%s is unresolvable or invalid for %s" % (q, proto))
-    if proto == "ipv4" and not ipv4_is_valid(q):
-        try:
-            q = resolve(q, "A")
-        except:
-            return error_page("%s is unresolvable or invalid for %s" % (q, proto))
+    if app.config.get("UNIFIED_DAEMON", False):
+        if not ip_is_valid(q):
+            try:
+                if app.config.get("UNIFIED_TRACEROUTE_IPV6", True):
+                    q = resolve_any(q)
+                else:
+                    q = resolve(q, "A")
+            except:
+                return error_page("%s is unresolvable" % q)
+        if ipv6_is_valid(q):
+            proto = "ipv6"
+        else:
+            proto = "ipv4"
+    else:
+        if proto == "ipv6" and not ipv6_is_valid(q):
+            try:
+                q = resolve(q, "AAAA")
+            except:
+                return error_page("%s is unresolvable or invalid for %s" % (q, proto))
+        if proto == "ipv4" and not ipv4_is_valid(q):
+            try:
+                q = resolve(q, "A")
+            except:
+                return error_page("%s is unresolvable or invalid for %s" % (q, proto))
 
     errors = []
     infos = {}
-    for host in hosts.split("+"):
+    hosts = hosts.split("+")
+    if hosts == ["all"]:
+        hosts = app.config["PROXY"].keys()
+    for host in hosts:
         status, resultat = bird_proxy(host, proto, "traceroute", q)
         if status is False:
             errors.append("%s" % resultat)
@@ -356,43 +412,51 @@ def traceroute(hosts, proto):
     return render_template('traceroute.html', infos=infos, errors=errors)
 
 
+@app.route("/adv/<hosts>")
 @app.route("/adv/<hosts>/<proto>")
-def show_route_filter(hosts, proto):
+def show_route_filter(hosts, proto="ipv4"):
     return show_route("adv", hosts, proto)
 
 
+@app.route("/adv_bgpmap/<hosts>")
 @app.route("/adv_bgpmap/<hosts>/<proto>")
-def show_route_filter_bgpmap(hosts, proto):
+def show_route_filter_bgpmap(hosts, proto="ipv4"):
     return show_route("adv_bgpmap", hosts, proto)
 
 
+@app.route("/where/<hosts>")
 @app.route("/where/<hosts>/<proto>")
-def show_route_where(hosts, proto):
+def show_route_where(hosts, proto="ipv4"):
     return show_route("where", hosts, proto)
 
 
+@app.route("/where_detail/<hosts>")
 @app.route("/where_detail/<hosts>/<proto>")
-def show_route_where_detail(hosts, proto):
+def show_route_where_detail(hosts, proto="ipv4"):
     return show_route("where_detail", hosts, proto)
 
 
+@app.route("/where_bgpmap/<hosts>")
 @app.route("/where_bgpmap/<hosts>/<proto>")
-def show_route_where_bgpmap(hosts, proto):
+def show_route_where_bgpmap(hosts, proto="ipv4"):
     return show_route("where_bgpmap", hosts, proto)
 
 
+@app.route("/prefix/<hosts>")
 @app.route("/prefix/<hosts>/<proto>")
-def show_route_for(hosts, proto):
+def show_route_for(hosts, proto="ipv4"):
     return show_route("prefix", hosts, proto)
 
 
+@app.route("/prefix_detail/<hosts>")
 @app.route("/prefix_detail/<hosts>/<proto>")
-def show_route_for_detail(hosts, proto):
+def show_route_for_detail(hosts, proto="ipv4"):
     return show_route("prefix_detail", hosts, proto)
 
 
+@app.route("/prefix_bgpmap/<hosts>")
 @app.route("/prefix_bgpmap/<hosts>/<proto>")
-def show_route_for_bgpmap(hosts, proto):
+def show_route_for_bgpmap(hosts, proto="ipv4"):
     return show_route("prefix_bgpmap", hosts, proto)
 
 
@@ -411,10 +475,14 @@ def get_as_name(_as):
     name = mc.get(str('lg_%s' % _as))
     if not name:
         app.logger.info("asn for as %s not found in memcache", _as)
-        name = get_asn_from_as(_as)[-1].replace(" ","\r",1)
-        if name:
+        asn_result = get_asn_from_as(_as)
+        if asn_result:
+            name = asn_result[-1].replace(" ","\r",1)
             mc.set(str("lg_%s" % _as), str(name), memcache_expiration)
-    return "AS%s | %s" % (_as, name)
+        else:
+            return "AS%s" % (_as)
+
+    return "AS%s | %s" % (_as, name.decode('utf-8'))
 
 
 def get_as_number_from_protocol_name(host, proto, protocol):
@@ -433,9 +501,9 @@ def show_bgpmap():
     data = get_query()
     if not data:
         abort(400)
-
+        
     data = base64.b64decode(data)
-    data = json.loads(data)
+    data = json.loads(data.decode('utf-8'))
 
     graph = pydot.Dot('BGPMAP', graph_type='digraph')
 
@@ -470,21 +538,19 @@ def show_bgpmap():
 
             label_without_star = kwargs["label"].replace("*", "")
             if e.get_label() is not None:
-                labels = e.get_label().split("\r")
+                labels = e.get_label().split("\r") 
             else:
                 return edges[edge_tuple]
             if "%s*" % label_without_star not in labels:
-                labels = [ kwargs["label"] ]  + [ l for l in labels if not l.startswith(label_without_star) ]
-                labels = sorted(labels, cmp=lambda x,y: x.endswith("*") and -1 or 1)
+                labels = [ kwargs["label"] ]  + [ l for l in labels if not l.startswith(label_without_star) ] 
+                labels = sorted(labels, key=lambda x: x.endswith("*") and -1 or 1)
+                
                 label = escape("\r".join(labels))
                 e.set_label(label)
         return edges[edge_tuple]
 
-    for host, asmaps in data.iteritems():
-        if "DOMAIN" in app.config:
-            add_node(host, label= "%s\r%s" % (host.upper(), app.config["DOMAIN"].upper()), shape="box", fillcolor="#F5A9A9")
-        else:
-            add_node(host, label= "%s" % (host.upper()), shape="box", fillcolor="#F5A9A9")
+    for host, asmaps in data.items():
+        add_node(host, label= "%s\r%s" % (host.upper(), app.config["DOMAIN"].upper()), shape="box", fillcolor="#F5A9A9")
 
         as_number = app.config["AS_NUMBER"].get(host, None)
         if as_number:
@@ -492,11 +558,11 @@ def show_bgpmap():
             edge = add_edge(as_number, nodes[host])
             edge.set_color("red")
             edge.set_style("bold")
-
+    
     #colors = [ "#009e23", "#1a6ec1" , "#d05701", "#6f879f", "#939a0e", "#0e9a93", "#9a0e85", "#56d8e1" ]
     previous_as = None
-    hosts = data.keys()
-    for host, asmaps in data.iteritems():
+    hosts = list(data.keys())
+    for host, asmaps in data.items():
         first = True
         for asmap in asmaps:
             previous_as = host
@@ -518,17 +584,17 @@ def show_bgpmap():
                 if not hop:
                     hop = True
                     if _as not in hosts:
-                        hop_label = _as
+                        hop_label = _as 
                         if first:
                             hop_label = hop_label + "*"
                         continue
                     else:
                         hop_label = ""
 
-                if _as == asmap[-1]:
-                    add_node(_as, fillcolor="#F5A9A9", shape="box", )
-                else:
-                    add_node(_as, fillcolor=(first and "#F5A9A9" or "white"), )
+                
+                add_node(_as, fillcolor=("white"))
+                if first:
+                    nodes[_as].set_fillcolor("#F5A9A9")
                 if hop_label:
                     edge = add_edge(nodes[previous_as], nodes[_as], label=hop_label, fontsize="7")
                 else:
@@ -536,19 +602,24 @@ def show_bgpmap():
 
                 hop_label = ""
 
-                if first or _as == asmap[-1]:
+                if first:
                     edge.set_style("bold")
                     edge.set_color("red")
-                elif edge.get_style() != "bold":
+                elif edge.get_color() != "red":
                     edge.set_style("dashed")
                     edge.set_color(color)
 
                 previous_as = _as
             first = False
 
+    if previous_as:
+        node = add_node(previous_as)
+        node.set_shape("box")
+
     for _as in prepend_as:
-        for n in set([ n for h, d in prepend_as[_as].iteritems() for p, n in d.iteritems() ]):
-            graph.add_edge(pydot.Edge(*(_as, _as), label=" %dx" % n, color="grey", fontcolor="grey"))
+       for n in set([ n for h, d in prepend_as[_as].items() for p, n in d.items() ]):
+           graph.add_edge(pydot.Edge(*(_as, _as), label=" %dx" % n, color="grey", fontcolor="grey"))
+        
 
     fmt = request.args.get('fmt', 'png')
     #response = Response("<pre>" + graph.create_dot() + "</pre>")
@@ -572,60 +643,85 @@ def build_as_tree_from_raw_bird_ouput(host, proto, text):
     path = None
     paths = []
     net_dest = None
-    peer_protocol_name = ""
     for line in text:
         line = line.strip()
 
-        expr = re.search(r'(.*)unicast\s+\[(\w+)\s+', line)
-        if expr:
-            if expr.group(1).strip():
-                net_dest = expr.group(1).strip()
-            peer_protocol_name = expr.group(2).strip()
+        # check for bird2 style line containing protocol name
+        # matches: ... unicast_[(protocol)_ ...
+        b2_unicast_line = re.search(r'(.*)unicast\s+\[(\w+)\s+', line)
+        if b2_unicast_line:
+            # save the net_dest and protocol name for later
+            if b2_unicast_line.group(1).strip():
+                net_dest = b2_unicast_line.group(1).strip()
+            peer_protocol_name = b2_unicast_line.group(2).strip()
 
-        expr2 = re.search(r'(.*)via\s+([0-9a-fA-F:\.]+)\s+on\s+\S+(\s+\[(\w+)\s+)?', line)
-        if expr2:
+        peer_match = False
+
+        # check line for bird1 style line
+        # matches: ___via_(next hop ip addr)_on_(iface)_[(protocol)_ ...
+        b1_peer_line = re.search(r'(.*)via\s+([0-9a-fA-F:\.]+)\s+on.*\[(\w+)\s+', line)
+        if b1_peer_line:
+            # save the net_dest, peer and protocol name for later
+            if b1_peer_line.group(1).strip():
+                net_dest = b1_peer_line.group(1).strip()
+            peer_ip = b1_peer_line.group(2).strip()
+            peer_protocol_name = b1_peer_line.group(3).strip()
+            # flag that a match was found
+            peer_match = True
+
+        else:
+            # if this wasn't a bird1 style peer line, then check for a bird2
+            # style line instead. Doing the check in the else clause prevents
+            # falsely matching bird1 lines
+            # matches: _via_(next hop address)
+            b2_peer_line = re.search(r'via\s+([0-9a-fA-F:\.]+)', line)
+            if b2_peer_line:
+                peer_ip = b2_peer_line.group(1).strip()
+                # flag that a match was found
+                peer_match = True
+
+        if peer_match:
+            # common code for when either a bird1 or bird2 peer line was found
             if path:
                 path.append(net_dest)
                 paths.append(path)
                 path = None
 
-            if expr2.group(1).strip():
-                net_dest = expr2.group(1).strip()
-
-            peer_ip = expr2.group(2).strip()
-            if expr2.group(4):
-                peer_protocol_name = expr2.group(4).strip()
             # Check if via line is a internal route
-            for rt_host, rt_ips in app.config["ROUTER_IP"].iteritems():
+            for rt_host, rt_ips in app.config["ROUTER_IP"].items():
                 # Special case for internal routing
                 if peer_ip in rt_ips:
-                    path = [rt_host]
+                    paths.append([peer_protocol_name, rt_host])
+                    path = None
                     break
-            else:
-                # ugly hack for good printing
-                path = [ peer_protocol_name ]
-#                path = ["%s\r%s" % (peer_protocol_name, get_as_name(get_as_number_from_protocol_name(host, proto, peer_protocol_name)))]
+                else:
+                    path = [ peer_protocol_name ]
 
-        expr3 = re.search(r'(.*)unreachable\s+\[(\w+)\s+', line)
-        if expr3:
+        # check for unreachable routes (common for bird1 & 2)
+        # matches: ...unreachable_[(protocol)_
+        unreachable_line = re.search(r'(.*)unreachable\s+\[(\w+)\s+', line)
+        if unreachable_line:
             if path:
                 path.append(net_dest)
                 paths.append(path)
                 path = None
 
-            if path is None:
-                path = [ expr3.group(2).strip() ]
+            if unreachable_line.group(1).strip():
+                net_dest = unreachable_line.group(1).strip()
 
-            if expr3.group(1).strip():
-                net_dest = expr3.group(1).strip()
+        # check for on-link routes
+        onlink_line = re.search(r'^dev', line)
+        if onlink_line:
+            paths.append([peer_protocol_name, net_dest])
+            path = None
 
-        if line.startswith("BGP.as_path:"):
+        if line.startswith("BGP.as_path:") and path:
             ASes = line.replace("BGP.as_path:", "").strip().split(" ")
             if path:
                 path.extend(ASes)
             else:
                 path = ASes
-
+    
     if path:
         path.append(net_dest)
         paths.append(path)
@@ -637,6 +733,11 @@ def show_route(request_type, hosts, proto):
     expression = get_query()
     if not expression:
         abort(400)
+
+    if (proto == "ip46"):
+        proto = "ipv4"
+    elif (proto == "ipflat"):
+        proto = "ipv6"
 
     set_session(request_type, hosts, proto, expression)
 
@@ -657,23 +758,37 @@ def show_route(request_type, hosts, proto):
         if len(expression.split("/")) == 2:
             expression, mask = (expression.split("/"))
 
-        if not mask and proto == "ipv4":
-            mask = "32"
-        if not mask and proto == "ipv6":
-            mask = "128"
-        if not mask_is_valid(mask):
-            return error_page("mask %s is invalid" % mask)
+        if app.config.get("UNIFIED_DAEMON", False):
+            if not ip_is_valid(expression):
+                try:
+                    expression = resolve_any(expression)
+                except:
+                    return error_page("%s is unresolvable" % expression)
 
-        if proto == "ipv6" and not ipv6_is_valid(expression):
-            try:
-                expression = resolve(expression, "AAAA")
-            except:
-                return error_page("%s is unresolvable or invalid for %s" % (expression, proto))
-        if proto == "ipv4" and not ipv4_is_valid(expression):
-            try:
-                expression = resolve(expression, "A")
-            except:
-                return error_page("%s is unresolvable or invalid for %s" % (expression, proto))
+            if not mask and ipv4_is_valid(expression):
+                mask = "32"
+            if not mask and ipv6_is_valid(expression):
+                mask = "128"
+            if not mask_is_valid(mask):
+                return error_page("mask %s is invalid" % mask)
+        else:
+            if not mask and proto == "ipv4":
+                mask = "32"
+            if not mask and proto == "ipv6":
+                mask = "128"
+            if not mask_is_valid(mask):
+                return error_page("mask %s is invalid" % mask)
+
+            if proto == "ipv6" and not ipv6_is_valid(expression):
+                try:
+                    expression = resolve(expression, "AAAA")
+                except:
+                    return error_page("%s is unresolvable or invalid for %s" % (expression, proto))
+            if proto == "ipv4" and not ipv4_is_valid(expression):
+                try:
+                    expression = resolve(expression, "A")
+                except:
+                    return error_page("%s is unresolvable or invalid for %s" % (expression, proto))
 
         if mask:
             expression += "/" + mask
@@ -682,25 +797,48 @@ def show_route(request_type, hosts, proto):
 
     detail = {}
     errors = []
-    for host in hosts.split("+"):
-        ret, res = bird_command(host, proto, command)
-        res = res.split("\n")
+    hosts = hosts.split("+")
+    if hosts == ["all"]:
+        hosts = list(app.config["PROXY"].keys())
+    allhosts = hosts[:]
+    if (proto == "ipflat" or proto == "ip46"):
+        prots = ["ipv4", "ipv6"]
+    else:
+        prots = [proto]
+    for host in allhosts:
+        for protx in prots:
+            ret, res = bird_command(host, proto, command)
+            res = res.split("\n")
 
-        if ret is False:
-            errors.append("%s" % res)
-            continue
+            if ret is False:
+                errors.append("%s" % res)
+                continue
 
-        if len(res) <= 1:
-            errors.append("%s: bird command failed with error, %s" % (host, "\n".join(res)))
-            continue
+            if len(res) <= 1:
+                errors.append("%s: bird command failed with error, %s" % (host, "\n".join(res)))
+                continue
 
-        if bgpmap:
-            detail[host] = build_as_tree_from_raw_bird_ouput(host, proto, res)
-        else:
-            detail[host] = add_links(res)
+            if bgpmap:
+                detail[host+protx] = build_as_tree_from_raw_bird_ouput(host, proto, res)
+                #for internal routes via hosts not selected
+                #add them to the list, but only show preferred route
+                if host not in hosts:
+                    detail[host+protx] = detail[host+protx][:1]
+                for path in detail[host+protx]:
+                    if len(path) == 2:
+                        if (path[1] not in allhosts) and (path[1] in app.config["PROXY"]):
+                            allhosts.append(path[1])
+
+            else:
+                detail[host+protx] = add_links(res)
 
     if bgpmap:
-        detail = base64.b64encode(json.dumps(detail))
+        # in python3 b64encode() encodes a byte-like object in to bytes
+        # so the json string needs to be encoded to bytes and then the
+        # base64 result decoded back to a string again
+        detail = json.dumps(detail)
+        detail = base64.b64encode(detail.encode('utf-8'))
+        detail = detail.decode('utf-8')
 
     return render_template((bgpmap and 'bgpmap.html' or 'route.html'), detail=detail, command=command, expression=expression, errors=errors)
 
