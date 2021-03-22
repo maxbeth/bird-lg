@@ -364,6 +364,12 @@ def detail(hosts, proto="ipv4"):
 @app.route("/traceroute/<hosts>")
 @app.route("/traceroute/<hosts>/<proto>")
 def traceroute(hosts, proto="ipv4"):
+
+    if (proto == "ip46"):
+        proto = "ipv4"
+    elif (proto == "ipflat"):
+        proto = "ipv6"
+
     q = get_query()
 
     if not q:
